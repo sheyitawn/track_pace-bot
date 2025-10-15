@@ -1,0 +1,19 @@
+.muted {
+    color: var(--muted);
+}
+
+/* fill the card and allow the table to grow/scroll if needed */
+.telemetry-root {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+}
+
+.telemetry-root h3 {
+    margin-top: 0;
+}
+
+.telemetry-root .table {
+    flex: 1;
+    overflow: auto;
+}

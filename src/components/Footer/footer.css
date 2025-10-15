@@ -1,0 +1,34 @@
+.site-footer {
+    margin-top: 24px;
+    padding: 14px 16px;
+    background: #0f1420;
+    border-top: 1px solid #1f283a;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: var(--muted);
+}
+
+.brand {
+    display: inline-flex;
+    align-items: center;
+    text-decoration: none;
+    color: var(--text);
+}
+
+.brand-logo {
+    width: 24px;
+    height: 24px;
+    margin-right: 8px;
+    border-radius: 4px;
+}
+
+.brand-text {
+    font-weight: 600;
+    letter-spacing: .2px;
+}
+
+.tagline {
+    font-size: 12px;
+}
