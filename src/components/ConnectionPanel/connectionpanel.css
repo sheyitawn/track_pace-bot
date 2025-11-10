@@ -3,3 +3,25 @@
     margin-top: 8px;
     font-size: 12px;
 }
+
+.disclosure {
+    background: var(--soft);
+    border: 1px solid #2a3346;
+    width: 100%;
+    text-align: left;
+    padding: 8px 10px;
+    border-radius: 10px;
+    margin-top: 8px;
+}
+
+.disclosure .arrow {
+    display: inline-block;
+    width: 16px;
+}
+
+.wifi-block {
+    margin-top: 10px;
+    padding: 10px;
+    border: 1px dashed #2b3550;
+    border-radius: 10px;
+}

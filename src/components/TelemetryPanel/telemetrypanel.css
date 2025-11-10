@@ -2,7 +2,6 @@
     color: var(--muted);
 }
 
-/* fill the card and allow the table to grow/scroll if needed */
 .telemetry-root {
     height: 100%;
     display: flex;

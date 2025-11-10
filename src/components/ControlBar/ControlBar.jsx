@@ -25,7 +25,6 @@ export default function ControlBar({
         <span className="badge">{mode}</span>
       </div>
       <div className="row">
-        {/* <label className="label">Ease-In</label> */}
         <p className="help">
           Use the controller to nudge the car onto the line, then press <em>Follow Track</em>.
         </p>

@@ -17,10 +17,17 @@ npm start
 ```
 
 ### Quick Use
-1. Connect device
-2. Add split profiles → Upload
-3. Press Follow Track
-4. Watch telemetry update live
+1. Power Device
+2. Connect to 'PaceBot-XXXX' Wifi AP. (pass: 'setup1234')
+3. Click Scan in the Connection Panel (under WIFI Setup)
+4. Select and Fill out wifi SSID & Password for WIFI you want to connect to
+2. Click Provision
+3. Click Connect. You should now be connected to the pace-bor, and see telemetry data coming through
+
+### Config Page
+### Modes
+### Teleoperation
+### Split Profiles
 
 
 © 2025 [sheyitawn.dev](https://sheyitawn.dev)
