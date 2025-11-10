@@ -152,4 +152,4 @@ select {
     font-size: 12px;
 }
 
-.tall { grid-row: span 2; height: 100%; }
+.tall { grid-row: span 3; height: 100%; }
