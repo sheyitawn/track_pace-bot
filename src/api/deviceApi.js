@@ -48,9 +48,12 @@ export const deviceApi = {
   getBaseUrl() { return _baseUrl; },
 
   async connect(url) {
-    _baseUrl = trimBase(url); // HTTP base
+    _baseUrl = (url || "").replace(/\/+$/,""); // HTTP base
     _unsub?.();
-    _unsub = openTelemetrySocket(_baseUrl, (j) => notifyTelemetry(j));
+    // wait for WS to be truly open
+    const unsub = await openTelemetrySocket(_baseUrl, (j) => notifyTelemetry(j));
+    _unsub = unsub;
+    try { await this.getStatus(); } catch { /* ignore */ }
     return true;
   },
 
@@ -60,6 +63,7 @@ export const deviceApi = {
     closeTelemetrySocket();
     return true;
   },
+
 
   async refreshConnection() {
     const url = _baseUrl;
