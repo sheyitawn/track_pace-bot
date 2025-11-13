@@ -22,7 +22,7 @@ npm start
 3. Click Scan in the Connection Panel (under WIFI Setup)
 4. Select and Fill out wifi SSID & Password for WIFI you want to connect to
 2. Click Provision
-3. Click Connect. You should now be connected to the pace-bor, and see telemetry data coming through
+3. Click Connect. You should now be connected to the pace-bot, and see telemetry data coming through
 
 ### Config Page
 ### Modes
