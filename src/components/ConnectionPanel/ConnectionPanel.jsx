@@ -3,8 +3,8 @@ import "./connectionpanel.css";
 import { deviceApi } from "../../api/deviceApi";
 
 export default function ConnectionPanel({ connected, onConnect, onDisconnect }) {
-  // CHANGED: default to HTTP base (not WS)
-  const [deviceUrl, setDeviceUrl] = useState("http://pacebot.local");
+  // const [deviceUrl, setDeviceUrl] = useState("http://pacebot.local");
+  const [deviceUrl, setDeviceUrl] = useState("http://192.168.1.207/");
   const [showWifi, setShowWifi] = useState(false);
 
   // AP provisioning state
