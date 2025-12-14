@@ -2,9 +2,17 @@ import React, { useState } from "react";
 import "./connectionpanel.css";
 import { deviceApi } from "../../api/deviceApi";
 
+function getDefaultDeviceUrl() {
+  // Use current origin when served from the ESP32
+  if (typeof window !== "undefined" && window.location && window.location.origin) {
+    return window.location.origin;
+  }
+  // Fallback for dev or SSR
+  return "http://pacebot.local";
+}
+
 export default function ConnectionPanel({ connected, onConnect, onDisconnect }) {
-  // const [deviceUrl, setDeviceUrl] = useState("http://pacebot.local");
-  const [deviceUrl, setDeviceUrl] = useState("http://192.168.1.207/");
+  const [deviceUrl, setDeviceUrl] = useState(getDefaultDeviceUrl());
   const [showWifi, setShowWifi] = useState(false);
 
   // AP provisioning state

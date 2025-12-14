@@ -1,5 +1,5 @@
-// ESP32-S3 + Dual Pololu QTRX-HD-07RC + Servo + ESC
-// Two-phase calibration and line following.
+// ESP32-S3 + Dual Pololu QTRX-HD-07RC (14 sensors) + Servo + ESC
+// Simple 7s calibration + robust white-line-on-brown line following.
 
 #include <Arduino.h>
 #include <ESP32Servo.h>
@@ -8,405 +8,321 @@
 #define EMITTER1_PIN 1
 #define EMITTER2_PIN 2
 
+// LEDs for calibration status
+#define LED_WHITE_PIN 19   // blinks during calibration
+#define LED_BROWN_PIN 20   // ON when ready
+
 const int NUM_SENSORS = 14;
 int sensorPins[NUM_SENSORS] = {
-  17,16,15,7,6,5,4,   // S0 to S6  (left board, L->R)
-  12,11,10,9,3,8,18   // S7 to S13 (right board, L->R)
+  17,16,15,7,6,5,4,      // S0..S6  (left board, L->R)
+  12,11,10,9,3,8,18      // S7..S13 (right board, L->R)
 };
 
-const int IGNORE_SENSOR_INDEX = 7;
+const int IGNORE_SENSOR_INDEX = 7; // S7 is known bad
 
-#define STEER_PIN    36
-#define THROTTLE_PIN 35
+// Steering + throttle (ESC)
+#define STEER_PIN     36
+#define THROTTLE_PIN  35
 
-Servo steer;
-Servo throttle;
+/* --------------- QTR RC timing config --------------- */
+const uint16_t QTR_TIMEOUT_US = 2500;   // Pololu default-ish
+uint16_t rawVals[NUM_SENSORS];          // "reflectance" values
+uint16_t calMin[NUM_SENSORS];
+uint16_t calMax[NUM_SENSORS];
+uint16_t normVals[NUM_SENSORS];         // 0..1000 (higher = whiter)
 
-/* ---------------- Config ---------------- */
-const uint16_t TIMEOUT_US     = 3000;
-const uint32_t CAL_PHASE_MS   = 7000;
-const int      MIN_SPREAD     = 150;
-const int      DECISION_DEADBAND_ERR = 400;
+/* --------------- Servo / ESC config --------------- */
+Servo steerServo;
+Servo throttleServo;
 
-const bool INVERT_STEERING    = false;
-const bool FORCE_INVERT_WHITE = true;
+// <<< TUNE: steering range / center
+const int STEER_CENTER_US = 1500;   // adjust to your straight-ahead value
+const int STEER_RANGE_US  = 400;    // +/- range from center (1100..1900)
 
-/* --- Steering / throttle --- */
-int steer_min_us   = 1100;
-int steer_neu_us   = 1500;
-int steer_max_us   = 1900;
+// <<< TUNE: ESC values
+const int THROTTLE_STOP_US     = 1500;  // neutral
+const int THROTTLE_FORWARD_US  = 1550;  // gentle forward
+const int THROTTLE_SLOW_US     = 1520;  // slow crawl (for line loss)
 
-int throttle_min_us    = 1500;  // ESC neutral
-int throttle_cruise_us = 1580;  // slow forward
-int throttle_max_us    = 1700;
+/* --------------- Line-following control --------------- */
+const long LINE_CENTER_POS = (NUM_SENSORS - 1) * 1000L / 2;  // 0..13000 → ~6500 center
 
-const int   STEER_MAX_OFFSET_US = 350;
-const int   STEER_DEADBAND_US   = 12;
+// PD gains (error is in "sensor index * 1000" units)
+// <<< TUNE: increase Kp for stronger turns, adjust Kd to reduce wobble
+float Kp = 0.00040f;   // proportional
+float Kd = 0.00120f;   // derivative
 
-const float ERR_FILTER_ALPHA    = 0.35f;
-float       errorFilt           = 0.0f;
+float lastError = 0.0f;
 
-const int   ERROR_SLOWDOWN_THRESH = 2000;
+/* ===========================================================
+   QTR Reading: RC timing, converted to "reflectance"
+   Higher rawVals[i]  = more reflective (whiter)
+   Lower rawVals[i]   = darker
+   =========================================================== */
+void readQTR(uint16_t *values) {
+  // Turn on emitters
+  digitalWrite(EMITTER1_PIN, HIGH);
+  digitalWrite(EMITTER2_PIN, HIGH);
 
-/* ---------------- Storage ---------------- */
-uint16_t whiteCal[NUM_SENSORS];
-uint16_t brownCal[NUM_SENSORS];
-bool     sensorBad[NUM_SENSORS];
-
-/* ---------------- Helpers ---------------- */
-static inline void emitters(bool leftOn, bool rightOn){
-  digitalWrite(EMITTER1_PIN, leftOn  ? HIGH : LOW);
-  digitalWrite(EMITTER2_PIN, rightOn ? HIGH : LOW);
-  delayMicroseconds(50);
-}
-
-uint16_t readQTR_RC_1pin(int pin, uint16_t timeoutUs) {
-  pinMode(pin, OUTPUT);
-  digitalWrite(pin, HIGH);
-  delayMicroseconds(10);
-  pinMode(pin, INPUT);
-  uint32_t t0 = micros();
-  while (digitalRead(pin) == HIGH) {
-    if ((uint32_t)(micros() - t0) >= timeoutUs) return timeoutUs;
+  // Charge all capacitors
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    pinMode(sensorPins[i], OUTPUT);
+    digitalWrite(sensorPins[i], HIGH);
   }
-  return (uint16_t)(micros() - t0);
-}
 
-// Ambient-subtracted RC time for one sensor
-uint16_t readDelta(int pin, bool leftOn, bool rightOn) {
-  emitters(false,false);
-  uint16_t amb = readQTR_RC_1pin(pin, TIMEOUT_US);
-  emitters(leftOn,rightOn);
-  uint16_t on  = readQTR_RC_1pin(pin, TIMEOUT_US);
-  return (on > amb) ? (uint16_t)(on - amb) : 0;
-}
+  delayMicroseconds(10); // charge time
 
-int contrastTop3MinusBottom3(const uint16_t *v, int n) {
-  uint16_t max1=0,max2=0,max3=0, min1=1000,min2=1000,min3=1000;
-  for (int i=0;i<n;i++){
-    uint16_t x=v[i];
-    if (x>max1){max3=max2;max2=max1;max1=x;}
-    else if (x>max2){max3=max2;max2=x;}
-    else if (x>max3){max3=x;}
-
-    if (x<min1){min3=min2;min2=min1;min1=x;}
-    else if (x<min2){min3=min2;min2=x;}
-    else if (x<min3){min3=x;}
+  // Switch to input to start discharging
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    pinMode(sensorPins[i], INPUT);
   }
-  return (int)((max1+max2+max3)/3) - (int)((min1+min2+min3)/3);
-}
 
-/* ---------------- Calibration ---------------- */
-// Average RC times over CAL_PHASE_MS for one surface (white or brown)
-void doPhaseCalibration(uint16_t calOut[NUM_SENSORS], const char* phaseName) {
-  uint32_t sum[NUM_SENSORS];
-  for (int i=0;i<NUM_SENSORS;i++) sum[i] = 0;
-  uint32_t samples = 0;
+  unsigned long start = micros();
+  bool done[NUM_SENSORS];
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    values[i] = 0;
+    done[i] = false;
+  }
 
-  Serial.println();
-  Serial.println("-------------------------------------------");
-  Serial.print("Phase: ");
-  Serial.println(phaseName);
-  Serial.println("Keep ALL sensors over that surface.");
-  Serial.println("-------------------------------------------");
+  while (true) {
+    unsigned long now = micros();
+    uint16_t elapsed = (uint16_t)(now - start);
+    bool allDone = true;
 
-  unsigned long t0 = millis();
-  while (millis() - t0 < CAL_PHASE_MS) {
-    for (int i=0;i<7;i++) {
-      uint16_t v = readDelta(sensorPins[i], true,false);
-      sum[i] += v;
+    if (elapsed >= QTR_TIMEOUT_US) {
+      // timeout: anything still high is at timeout
+      for (int i = 0; i < NUM_SENSORS; i++) {
+        if (!done[i]) {
+          // "reflectance" = 0 at timeout (very dark)
+          values[i] = 0;
+          done[i] = true;
+        }
+      }
+      break;
     }
-    for (int i=7;i<14;i++) {
-      uint16_t v = readDelta(sensorPins[i], false,true);
-      sum[i] += v;
+
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      if (!done[i]) {
+        int v = digitalRead(sensorPins[i]);
+        if (v == LOW) {
+          // Discharge time is "elapsed".
+          // Convert to "reflectance": high reflect = small elapsed → large value.
+          uint16_t reflect = (elapsed >= QTR_TIMEOUT_US) ? 0 : (QTR_TIMEOUT_US - elapsed);
+          values[i] = reflect;
+          done[i] = true;
+        }
+      }
     }
-    samples++;
-    delay(2);
+
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      if (!done[i]) {
+        allDone = false;
+        break;
+      }
+    }
+    if (allDone) break;
   }
 
-  for (int i=0;i<NUM_SENSORS;i++) {
-    calOut[i] = (uint16_t)(sum[i] / max<uint32_t>(samples,1));
-  }
-
-  Serial.print("Done ");
-  Serial.println(phaseName);
-  for (int i=0;i<NUM_SENSORS;i++) {
-    Serial.print("S"); Serial.print(i);
-    Serial.print(": ");
-    Serial.println(calOut[i]);
-  }
-  Serial.println();
+  // (Optional) Turn emitters off between reads if you want to save power
+  // digitalWrite(EMITTER1_PIN, LOW);
+  // digitalWrite(EMITTER2_PIN, LOW);
 }
 
-/* ---------------- Setup ---------------- */
-void setup() {
-  Serial.begin(115200);
-  delay(500);
+/* ===========================================================
+   Calibration: 7 seconds total
+   - Move robot so each sensor sees white and brown
+   - LED_WHITE blinks during calibration
+   - LED_BROWN turns ON when done
+   =========================================================== */
+void calibrateQTR() {
+  // init calibration arrays
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    calMin[i] = 65535;
+    calMax[i] = 0;
+  }
 
-  pinMode(EMITTER1_PIN, OUTPUT);
-  pinMode(EMITTER2_PIN, OUTPUT);
-  emitters(true,true);
+  unsigned long start = millis();
+  const unsigned long CAL_TIME_MS = 7000;
 
-  steer.setPeriodHertz(50);
-  throttle.setPeriodHertz(50);
-  steer.attach(STEER_PIN, 800, 2200);
-  throttle.attach(THROTTLE_PIN, 800, 2200);
-  steer.writeMicroseconds(steer_neu_us);
-  throttle.writeMicroseconds(throttle_min_us);
-
-  Serial.println("QTRX line follower with 2-phase calibration");
-  Serial.println("1) Place ALL sensors over WHITE line.");
-  Serial.println("   Press ENTER in Serial Monitor to start phase 1.\n");
-
-  while (!Serial.available()) delay(10);
-  while (Serial.available()) Serial.read();
-
-  doPhaseCalibration(whiteCal, "White calibration (WHITE LINE)");
-
-  Serial.println("Now place ALL sensors over BROWN ground (no line).");
-  Serial.println("Press ENTER in Serial Monitor to start phase 2.\n");
-  while (!Serial.available()) delay(10);
-  while (Serial.available()) Serial.read();
-
-  doPhaseCalibration(brownCal, "Brown calibration (BROWN GROUND)");
-
-  // Flag sensors with almost no difference between white and brown as bad
-  Serial.println("Detecting bad sensors (low white/brown difference)...");
-  for (int i=0;i<NUM_SENSORS;i++) {
-    uint16_t w = whiteCal[i];
-    uint16_t b = brownCal[i];
-    uint16_t diff = (w > b) ? (w - b) : (b - w);
-
-    if (i == IGNORE_SENSOR_INDEX) {
-      sensorBad[i] = true;
+  while (millis() - start < CAL_TIME_MS) {
+    // Blink LED_WHITE about 4 Hz
+    if (((millis() / 125) % 2) == 0) {
+      digitalWrite(LED_WHITE_PIN, HIGH);
     } else {
-      sensorBad[i] = (diff < 2);
+      digitalWrite(LED_WHITE_PIN, LOW);
     }
 
-    Serial.print("S"); Serial.print(i);
-    Serial.print("  whiteCal="); Serial.print(w);
-    Serial.print("  brownCal="); Serial.print(b);
-    Serial.print("  diff="); Serial.print(diff);
-    Serial.print("  -> ");
-    Serial.println(sensorBad[i] ? "BAD/IGNORED" : "OK");
+    readQTR(rawVals);
+
+    // Update calibration limits
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      if (i == IGNORE_SENSOR_INDEX) continue;
+
+      uint16_t v = rawVals[i];
+      if (v < calMin[i]) calMin[i] = v;
+      if (v > calMax[i]) calMax[i] = v;
+    }
+
+    delay(5); // small delay to avoid hammering
   }
-  Serial.println();
+
+  // End of calibration: turn off WHITE LED, turn on BROWN LED
+  digitalWrite(LED_WHITE_PIN, LOW);
+  digitalWrite(LED_BROWN_PIN, HIGH);
 }
 
-/* ---------------- Loop ---------------- */
-void loop() {
-  uint16_t rawDelta[NUM_SENSORS];
-  uint16_t whiteness[NUM_SENSORS];  // 0..1000, 0 = brown, 1000 = white
-
-  int steerTarget    = steer_neu_us;
-  int throttleTarget = throttle_min_us;
-
-  // Read all sensors
-  for (int i=0;i<7;i++) {
-    rawDelta[i] = readDelta(sensorPins[i], true,false);
-  }
-  for (int i=7;i<14;i++) {
-    rawDelta[i] = readDelta(sensorPins[i], false,true);
-  }
-  emitters(true,true);
-
-  uint16_t minW = 1000, maxW = 0;
-
-  for (int i=0;i<NUM_SENSORS;i++) {
-    if (sensorBad[i]) {
-      whiteness[i] = 0;
+/* ===========================================================
+   Normalize sensor values to 0..1000
+   - 0   -> darkest seen during calibration
+   - 1000-> brightest seen during calibration (white line)
+   =========================================================== */
+void normalizeSensors() {
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    if (i == IGNORE_SENSOR_INDEX) {
+      normVals[i] = 0;
       continue;
     }
 
-    int32_t wCal = (int32_t)whiteCal[i];
-    int32_t bCal = (int32_t)brownCal[i];
-    int32_t span = wCal - bCal;  // may be positive or negative
+    uint16_t v = rawVals[i];
+    uint16_t minV = calMin[i];
+    uint16_t maxV = calMax[i];
 
-    if (span == 0) {
-      whiteness[i] = 0;
-    } else {
-      int32_t raw = (int32_t)rawDelta[i];
-      int32_t num;
-
-      if (span > 0) {
-        num = raw - bCal;
-      } else {
-        num = bCal - raw;
-        span = -span;
-      }
-
-      if (num < 0)    num = 0;
-      if (num > span) num = span;
-
-      uint16_t wNorm = (uint16_t)((num * 1000L) / span);
-      if (FORCE_INVERT_WHITE) wNorm = 1000 - wNorm;
-      whiteness[i] = wNorm;
+    if (maxV <= minV) {
+      normVals[i] = 0;
+      continue;
     }
 
-    if (whiteness[i] < minW) minW = whiteness[i];
-    if (whiteness[i] > maxW) maxW = whiteness[i];
+    long val = (long)(v - minV) * 1000L / (long)(maxV - minV);
+    if (val < 0) val = 0;
+    if (val > 1000) val = 1000;
+    normVals[i] = (uint16_t)val;
+  }
+}
+
+/* ===========================================================
+   readLine():
+   - Uses normalized values (higher = whiter = line)
+   - Returns position in 0..(NUM_SENSORS-1)*1000
+   - If no line detected, returns last known position
+   =========================================================== */
+long readLinePosition() {
+  static long lastPos = LINE_CENTER_POS; // fallback if line lost
+
+  long weightedSum = 0;
+  long sum = 0;
+
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    if (i == IGNORE_SENSOR_INDEX) continue;
+
+    uint16_t v = normVals[i]; // 0..1000, high = line
+    long weight = i * 1000L;
+
+    weightedSum += (long)v * weight;
+    sum += v;
   }
 
-  uint16_t spread = maxW - minW;
+  if (sum == 0) {
+    // Line lost: return last known position
+    return lastPos;
+  }
 
-  enum Cell { CELL_BROWN, CELL_WHITE, CELL_UNKNOWN };
-  Cell baseClass[NUM_SENSORS];
-  const char* decision = "NO LINE";
-  long errorRaw = 0;
+  long pos = weightedSum / sum;
+  lastPos = pos;
+  return pos;
+}
 
-  // If spread is too small, assume no reliable line
-  if (spread < MIN_SPREAD) {
-    Serial.println("[no line]");
-    Serial.print("Decision: NO LINE (spread low: ");
-    Serial.print(spread);
-    Serial.println(")");
+/* ===========================================================
+   Apply steering + throttle based on line position
+   =========================================================== */
+void updateControl() {
+  long pos = readLinePosition();
+
+  // error: positive if line is to the LEFT or RIGHT?
+  // Here: error = CENTER - pos
+  // If your robot steers the wrong way, flip the sign below.
+  long error = LINE_CENTER_POS - pos;
+
+  float e = (float)error;
+  float pTerm = Kp * e;
+  float dTerm = Kd * (e - lastError);
+  float control = pTerm + dTerm;
+  lastError = e;
+
+  // Clamp control to [-1, 1]
+  if (control > 1.0f) control = 1.0f;
+  if (control < -1.0f) control = -1.0f;
+
+  // Steering pulse
+  int steerPulse = STEER_CENTER_US + (int)(control * STEER_RANGE_US);
+  steerPulse = constrain(steerPulse, STEER_CENTER_US - STEER_RANGE_US, STEER_CENTER_US + STEER_RANGE_US);
+
+  // Basic line-loss detection: if total "whiteness" is tiny, slow down
+  long sumWhiteness = 0;
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    if (i == IGNORE_SENSOR_INDEX) continue;
+    sumWhiteness += normVals[i];
+  }
+
+  int throttlePulse;
+  if (sumWhiteness < 2000) {
+    // Likely off the line → slow crawl
+    throttlePulse = THROTTLE_SLOW_US;
   } else {
-    // Dynamic thresholds based on current min/max
-    uint16_t tLow  = minW + spread / 3;
-    uint16_t tHigh = minW + (spread * 2) / 3;
-
-    int firstWhite = -1;
-    int lastWhite  = -1;
-
-    // Classify each sensor as white / brown / unknown
-    for (int i=0;i<NUM_SENSORS;i++) {
-      if (sensorBad[i]) {
-        baseClass[i] = CELL_UNKNOWN;
-        continue;
-      }
-
-      uint16_t w = whiteness[i];
-      if (w >= tHigh) {
-        baseClass[i] = CELL_WHITE;
-        if (firstWhite < 0) firstWhite = i;
-        lastWhite = i;
-      } else if (w <= tLow) {
-        baseClass[i] = CELL_BROWN;
-      } else {
-        baseClass[i] = CELL_UNKNOWN;
-      }
-    }
-
-    if (firstWhite < 0) {
-      Serial.println("[no line]");
-      Serial.println("Decision: NO LINE (no strong line segment)");
-    } else {
-      // Enforce a single continuous line segment
-      for (int i=firstWhite; i<=lastWhite; i++) {
-        if (baseClass[i] == CELL_BROWN) baseClass[i] = CELL_UNKNOWN;
-      }
-
-      // Compute weighted line position error
-      long num = 0;
-      long den = 0;
-      for (int i=0;i<NUM_SENSORS;i++) {
-        int pos = i * 1000 - 6500;  // -6500..+6500 across array
-        int weight = (baseClass[i] == CELL_WHITE) ? whiteness[i] : 0;
-        num += (long)pos * (long)weight;
-        den += weight;
-      }
-      if (den != 0) errorRaw = num / den;
-
-      // Filter error to reduce jitter
-      float e = (float)errorRaw;
-      if (INVERT_STEERING) e = -e;
-      errorFilt = errorFilt + ERR_FILTER_ALPHA * (e - errorFilt);
-
-      long decErr = (long)lroundf(errorFilt);
-
-      if (den == 0) {
-        decision = "NO LINE (no line cells)";
-      } else if (abs(decErr) <= DECISION_DEADBAND_ERR) {
-        decision = "GO STRAIGHT";
-      } else if (decErr < 0) {
-        decision = "TURN LEFT";
-      } else {
-        decision = "TURN RIGHT";
-      }
-
-      // Map filtered error to steering PWM
-      float norm = constrain(errorFilt / 6500.0f, -1.0f, 1.0f);
-      int steerOffset = (int)lroundf(norm * (float)STEER_MAX_OFFSET_US);
-      if (abs(steerOffset) < STEER_DEADBAND_US) steerOffset = 0;
-
-      steerTarget = steer_neu_us + steerOffset;
-      if (steerTarget < steer_min_us) steerTarget = steer_min_us;
-      if (steerTarget > steer_max_us) steerTarget = steer_max_us;
-
-      // Throttle: slow down when error is large
-      int absErr = abs(decErr);
-      throttleTarget = throttle_cruise_us;
-      if (absErr > ERROR_SLOWDOWN_THRESH) {
-        int delta = map(absErr,
-                        ERROR_SLOWDOWN_THRESH,
-                        6500,
-                        0,
-                        (throttle_cruise_us - throttle_min_us));
-        throttleTarget = throttle_cruise_us - delta;
-      }
-      if (throttleTarget < throttle_min_us) throttleTarget = throttle_min_us;
-      if (throttleTarget > throttle_max_us) throttleTarget = throttle_max_us;
-
-      // Symbolic visualisation of sensor states
-      Serial.print("[");
-      for (int i=0;i<NUM_SENSORS;i++){
-        const char* label;
-        if (sensorBad[i]) {
-          label = "x";
-        } else {
-          switch (baseClass[i]) {
-            case CELL_WHITE:   label = "||"; break;
-            case CELL_BROWN:   label = "--"; break;
-            case CELL_UNKNOWN: label = "?";  break;
-            default:           label = "?";  break;
-          }
-        }
-        Serial.print(label);
-        if (i < NUM_SENSORS-1) Serial.print(", ");
-      }
-      Serial.println("]");
-
-      // Print decision and key values
-      Serial.print("Decision: ");
-      Serial.print(decision);
-      Serial.print("  (errorRaw=");
-      Serial.print(errorRaw);
-      Serial.print(", filtErr=");
-      Serial.print(errorFilt);
-      Serial.print(", minW=");
-      Serial.print(minW);
-      Serial.print(", maxW=");
-      Serial.print(maxW);
-      Serial.print(", spread=");
-      Serial.print(spread);
-      Serial.print(", steer_us=");
-      Serial.print(steerTarget);
-      Serial.print(", thr_us=");
-      Serial.print(throttleTarget);
-      Serial.println(")");
-    }
+    throttlePulse = THROTTLE_FORWARD_US;
   }
 
-  // Numeric dumps for tuning
-  Serial.print("rawDelta:  [");
-  for (int i=0;i<NUM_SENSORS;i++){
-    Serial.print(rawDelta[i]);
-    if (i < NUM_SENSORS-1) Serial.print(", ");
-  }
-  Serial.println("]");
+  steerServo.writeMicroseconds(steerPulse);
+  throttleServo.writeMicroseconds(throttlePulse);
+}
 
-  Serial.print("whiteness: [");
-  for (int i=0;i<NUM_SENSORS;i++){
-    Serial.print(whiteness[i]);
-    if (i < NUM_SENSORS-1) Serial.print(", ");
-  }
-  Serial.println("]  // 0..1000, 0=brown, 1000=white");
+/* ===========================================================
+   SETUP
+   =========================================================== */
+void setup() {
+  Serial.begin(115200);
 
-  Serial.println("------------------------------------------------");
+  pinMode(EMITTER1_PIN, OUTPUT);
+  pinMode(EMITTER2_PIN, OUTPUT);
+  digitalWrite(EMITTER1_PIN, LOW);
+  digitalWrite(EMITTER2_PIN, LOW);
 
-  // Apply steering and throttle
-  steer.writeMicroseconds(steerTarget);
-  throttle.writeMicroseconds(throttleTarget);
+  pinMode(LED_WHITE_PIN, OUTPUT);
+  pinMode(LED_BROWN_PIN, OUTPUT);
+  digitalWrite(LED_WHITE_PIN, LOW);
+  digitalWrite(LED_BROWN_PIN, LOW);
 
-  delay(80);
+  // Attach servos
+  steerServo.attach(STEER_PIN, 1000, 2000);
+  throttleServo.attach(THROTTLE_PIN, 1000, 2000);
+
+  // Stop motors initially
+  steerServo.writeMicroseconds(STEER_CENTER_US);
+  throttleServo.writeMicroseconds(THROTTLE_STOP_US);
+
+  delay(1000); // small pause
+
+  // 7-second calibration
+  calibrateQTR();
+
+  // Short pause before starting line following
+  throttleServo.writeMicroseconds(THROTTLE_STOP_US);
+  steerServo.writeMicroseconds(STEER_CENTER_US);
+  delay(500);
+}
+
+/* ===========================================================
+   LOOP
+   =========================================================== */
+void loop() {
+  // Read sensors
+  readQTR(rawVals);
+
+  // Normalize to 0..1000 (white line = high)
+  normalizeSensors();
+
+  // Update steering + throttle
+  updateControl();
+
+  // Optional small delay for stability
+  delay(5);
 }

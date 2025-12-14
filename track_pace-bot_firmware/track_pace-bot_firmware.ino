@@ -1,6 +1,8 @@
 /*
   PaceBot – ESP32-S3 RC + QTR + Wi-Fi Provisioning + WebSocket Telemetry + MPU-6500 + Encoder (AS5048A PWM)
-  Runtime Config editable over HTTP (/config)
+  - Runtime Config editable over HTTP (/config)
+  - React UI served from LittleFS at "/"
+  - New PD-based line follower for white line on brown surface
 
   Endpoints:
     GET  /config
@@ -8,12 +10,8 @@
     POST /config/reset
     GET  /wifi/scan
     POST /wifi/connect {"ssid":"..","password":".."}
-    GET  /wifi/status
+    GET  /wifi/status./'zz
     POST /wifi/forget
-
-  Notes:
-    - Config lives in NVS (Preferences "pacebot", key "cfg") as JSON.
-    - Control loop reads config live (no reboot needed).
 */
 
 #include <Arduino.h>
@@ -26,6 +24,7 @@
 #include <ESP32Servo.h>
 #include <Wire.h>
 #include <math.h>
+#include <LittleFS.h>
 
 /* ===================== PINS ===================== */
 // QTRX #1 (one 7-sensor board)
@@ -70,7 +69,12 @@ Servo steer, throttle;
 const int NUM_SENSORS = 14;
 int sensorPins[NUM_SENSORS];
 uint16_t calMin[NUM_SENSORS], calMax[NUM_SENSORS];
-int lastSteerUS = 1500;
+
+// QTR buffers
+uint16_t rawVals[NUM_SENSORS];   // RC times
+uint16_t normVals[NUM_SENSORS];  // 0..1000, high = white line
+
+int lastSteerUS    = 1500;
 int lastThrottleUS = 1500;
 
 uint32_t lastTelem = 0;
@@ -82,14 +86,22 @@ int teleopThrottleUS  = 1500;
 uint32_t lastTeleopMs = 0;
 static const uint32_t TELEOP_TIMEOUT_MS = 300;  // neutral if stale
 
+/* ========== Line position / PD steering config ========== */
+const long LINE_CENTER_POS = (NUM_SENSORS - 1) * 1000L / 2; // 0..13000 → 6500 center
+
+static float lf_lastError = 0.0f;
+// PD gains for white-on-brown line following
+const float  LF_KP        = 0.00040f;
+const float  LF_KD        = 0.00120f;
+
 /* ===================== Encoder types & helpers ===================== */
 struct EncSample {
   uint32_t high_us;
   uint32_t low_us;
   uint32_t period_us;
-  float    duty;        // 0..1
-  float    angle_deg;   // 0..360
-  uint16_t angle_14bit; // 0..16383
+  float    duty;
+  float    angle_deg;
+  uint16_t angle_14bit;
 };
 
 static bool encReadOnce(EncSample &s, int pin) {
@@ -145,7 +157,6 @@ static float    speed_mps_curr     = 0.0;
 static void updateEncoder() {
   EncSample s;
   if (!encReadAveraged(s, ENC_PWM_PIN, 5)) {
-    // If we lose signal, decay the reported speed
     speed_mps_curr *= 0.9f;
     return;
   }
@@ -158,17 +169,16 @@ static void updateEncoder() {
   }
 
   float ddeg = s.angle_deg - enc_last_angle_deg;
-  // unwrap across 0/360 to the shortest path
+
   if (ddeg >  180.0f) ddeg -= 360.0f;
   if (ddeg < -180.0f) ddeg += 360.0f;
 
   float dt_s = (now_ms - enc_last_ts_ms) * 0.001f;
   if (dt_s <= 0.0f) dt_s = 1e-3f;
 
-  // angular speed (rad/s)
   float omega = (ddeg * (float)M_PI / 180.0f) / dt_s;
 
-  // linear speed and incremental distance
+
   speed_mps_curr   = omega * WHEEL_RADIUS_M;
   distance_m_accum += fabsf(ddeg) * ((float)M_PI / 180.0f) * WHEEL_RADIUS_M;
 
@@ -318,7 +328,6 @@ struct Config {
   uint16_t qtr_timeout_us;
   unsigned long calibrate_ms;
 
-
   float qtr_gamma;
   int   qtr_smooth_n;
   int   min_line_contrast;
@@ -336,7 +345,7 @@ struct Config {
 
     esc_arm_ms = 3000;
     qtr_timeout_us = 3000;
-    calibrate_ms = 3000;
+    calibrate_ms = 7000;   // 7 s calibration by default
 
     qtr_gamma         = 0.75f;
     qtr_smooth_n      = 3;
@@ -453,6 +462,9 @@ void sendJSON(const String& s) { addCORS(); http.send(200, "application/json", s
 void sendErr(int code, const String& msg) { addCORS(); http.send(code, "application/json", "{\"error\":\""+msg+"\"}"); }
 
 /* ===================== QTR Helpers ===================== */
+
+
+
 uint16_t readQTR_RC_1pin(int pin, uint16_t timeoutUs) {
   pinMode(pin, OUTPUT);
   digitalWrite(pin, HIGH);
@@ -464,35 +476,104 @@ uint16_t readQTR_RC_1pin(int pin, uint16_t timeoutUs) {
   }
   return (uint16_t)(micros() - start);
 }
-inline uint16_t normalize(uint16_t raw, uint16_t rmin, uint16_t rmax){
-  if (raw < rmin) raw = rmin; if (raw > rmax) raw = rmax;
-  return (uint16_t)(((uint32_t)(raw - rmin) * 1000UL) / (uint32_t)(rmax - rmin));
+
+// Read all sensors raw (RC time) with both emitters ON
+void readQTRRawAll() {
+  digitalWrite(EMITTER1_PIN, HIGH);
+  digitalWrite(EMITTER2_PIN, HIGH);
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    rawVals[i] = readQTR_RC_1pin(sensorPins[i], cfg.qtr_timeout_us);
+  }
 }
+
+// normalize all sensors to 0..1000 (high = white line)
+void qtrNormalizeAll() {
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    uint16_t v    = rawVals[i];
+    uint16_t minV = calMin[i];
+    uint16_t maxV = calMax[i];
+
+    if (maxV <= minV) {
+      normVals[i] = 0;
+      continue;
+    }
+
+    long val = (long)(maxV - v) * 1000L / (long)(maxV - minV);
+    if (val < 0)   val = 0;
+    if (val > 1000) val = 1000;
+    normVals[i] = (uint16_t)val;
+  }
+}
+
+// weighted centroid of normalized values
+long readLinePosition() {
+  static long lastPos = LINE_CENTER_POS;
+  long weightedSum = 0;
+  long sum = 0;
+
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    uint16_t v = normVals[i]; // 0..1000, high = line
+    long weight = i * 1000L;
+    weightedSum += (long)v * weight;
+    sum += v;
+  }
+
+  if (sum == 0) {
+    return lastPos;
+  }
+
+  long pos = weightedSum / sum;
+  lastPos = pos;
+  return pos;
+}
+
+// calibration using raw-all read, for given duration (ms)
 void qtrCalibrate(unsigned long ms){
-  Serial.println("[QTR] Calibrating... move across line & background");
+  Serial.println("[QTR] Calibrating... move across white line & brown background");
   for (int i=0;i<NUM_SENSORS;i++){ calMin[i]=0xFFFF; calMax[i]=0; }
+
   unsigned long t0 = millis();
   while (millis() - t0 < ms) {
+    readQTRRawAll();
+
     for (int i=0;i<NUM_SENSORS;i++){
-      uint16_t v = readQTR_RC_1pin(sensorPins[i], cfg.qtr_timeout_us);
+      uint16_t v = rawVals[i];
       if (v < calMin[i]) calMin[i] = v;
       if (v > calMax[i]) calMax[i] = v;
     }
     delay(5);
   }
+
   for (int i=0;i<NUM_SENSORS;i++){
     if (calMax[i] <= calMin[i]) calMax[i] = calMin[i] + 1;
   }
   Serial.println("[QTR] Calibration done");
 }
+
+// PD steering based on line error
 void setSteerFromError(long error){
-  // deadband to reduce twitch
-  if (abs(error) <= cfg.deadband_error) error = 0;
-  int offset = (int)(cfg.Kp * error);   // µs offset around neutral
-  int target = clampUS(cfg.us_neu + offset, cfg.steer_min_us, cfg.steer_max_us);
+  float e = (float)error;
+  float pTerm = LF_KP * e;
+  float dTerm = LF_KD * (e - lf_lastError);
+  lf_lastError = e;
+
+  float control = pTerm + dTerm;  // -inf..+inf
+  if (control > 1.0f) control = 1.0f;
+  if (control < -1.0f) control = -1.0f;
+
+  int steerSpanL = cfg.us_neu - cfg.steer_min_us;   // left range
+  int steerSpanR = cfg.steer_max_us - cfg.us_neu;   // right range
+
+  int steerDelta = (control < 0.0f)
+    ? (int)lroundf(control * steerSpanL)
+    : (int)lroundf(control * steerSpanR);
+
+  int target = clampUS(cfg.us_neu + steerDelta, cfg.steer_min_us, cfg.steer_max_us);
   steer.writeMicroseconds(target);
   lastSteerUS = target;
 }
+
+// throttle logic: uses existing config fields
 void setThrottleByErrorAndConf(long absErr, int confidence){
   int us = cfg.throttle_base;
   if (confidence < cfg.lost_confidence_sum) {
@@ -512,13 +593,11 @@ void setTeleopFromXY(float x, float y) {
   if (x < -1) x = -1; if (x >  1) x = 1;
   if (y < -1) y = -1; if (y >  1) y = 1;
 
-  // Steering around neutral within
   int steerSpanL = cfg.us_neu - cfg.steer_min_us;
   int steerSpanR = cfg.steer_max_us - cfg.us_neu;
   int steerDelta = (x < 0) ? (int)lroundf(x * steerSpanL) : (int)lroundf(x * steerSpanR);
   int steerTarget = clampUS(cfg.us_neu + steerDelta, cfg.steer_min_us, cfg.steer_max_us);
 
-  // Throttle: y>0 => forward up to throttle_max; y<0 => reverse down to throttle_min
   int thrForward = cfg.throttle_max - cfg.us_neu;
   int thrReverse = cfg.us_neu - cfg.throttle_min;
   int thrDelta   = (y >= 0) ? (int)lroundf(y * thrForward) : (int)lroundf(y * -thrReverse);
@@ -529,79 +608,7 @@ void setTeleopFromXY(float x, float y) {
   lastTeleopMs = millis();
 }
 
-/* ===================== ADDITIONS FOR QTR ===================== */
-// Drive emitters explicitly
-static inline void qtrEmitters(bool leftOn, bool rightOn){
-  digitalWrite(EMITTER1_PIN, leftOn  ? HIGH : LOW);
-  digitalWrite(EMITTER2_PIN, rightOn ? HIGH : LOW);
-  delayMicroseconds(50); // settle LEDs
-}
-
-// Read ambient-subtracted value with a chosen emitter state
-static uint16_t readQTR_RC_delta(int pin, uint16_t timeoutUs, bool leftOn, bool rightOn){
-  qtrEmitters(false, false);
-  uint16_t amb = readQTR_RC_1pin(pin, timeoutUs);
-  qtrEmitters(leftOn, rightOn);
-  uint16_t on  = readQTR_RC_1pin(pin, timeoutUs);
-  return (on > amb) ? (uint16_t)(on - amb) : 0;
-}
-
-// Temporal median (N=3) ring buffer
-static const int TEMP_N = 3;
-static uint16_t temp_hist[NUM_SENSORS][TEMP_N];
-static uint8_t  temp_idx = 0;
-
-static inline uint16_t median3(uint16_t a, uint16_t b, uint16_t c){
-  if (a > b) { uint16_t t=a; a=b; b=t; }
-  if (b > c) { uint16_t t=b; b=c; c=t; }
-  if (a > b) { uint16_t t=a; a=b; b=t; }
-  return b;
-}
-static void temporalPush(const uint16_t v[NUM_SENSORS]){
-  for(int i=0;i<NUM_SENSORS;i++) temp_hist[i][temp_idx] = v[i];
-  temp_idx = (temp_idx + 1) % TEMP_N;
-}
-static void temporalMedian(uint16_t out[NUM_SENSORS]){
-  for(int i=0;i<NUM_SENSORS;i++)
-    out[i] = median3(temp_hist[i][0], temp_hist[i][1], temp_hist[i][2]);
-}
-
-// Contrast = mean(top3) - mean(bottom3)
-static int contrastTop3MinusBottom3(const uint16_t v[NUM_SENSORS]){
-  uint16_t min1=1000,min2=1000,min3=1000, max1=0,max2=0,max3=0;
-  for(int i=0;i<NUM_SENSORS;i++){
-    uint16_t x=v[i];
-    if (x>max1){ max3=max2; max2=max1; max1=x; }
-    else if (x>max2){ max3=max2; max2=x; }
-    else if (x>max3){ max3=x; }
-    if (x<min1){ min3=min2; min2=min1; min1=x; }
-    else if (x<min2){ min3=min2; min2=x; }
-    else if (x<min3){ min3=x; }
-  }
-  int topMean = (max1+max2+max3)/3;
-  int botMean = (min1+min2+min3)/3;
-  return topMean - botMean;
-}
-
-// Robust centroid over bright band only
-static long robustCentroid(const uint16_t v[NUM_SENSORS], int band, bool &hasLine){
-  uint16_t vmax = 0;
-  for (int i=0;i<NUM_SENSORS;i++) if (v[i] > vmax) vmax = v[i];
-  int thr = (int)vmax - band; if (thr < 0) thr = 0;
-
-  long num = 0, den = 0;
-  for (int i=0;i<NUM_SENSORS;i++){
-    if (v[i] >= thr){
-      int pos = i*1000 - 6500;
-      num += (long)pos * (long)v[i];
-      den += v[i];
-    }
-  }
-  if (den == 0) { hasLine=false; return 0; }
-  hasLine=true;
-  return num / den;
-}
-
+/* ===================== Sensor order ===================== */
 static void buildSensorOrder() {
 #if SWAP_BLOCKS
 #endif
@@ -619,6 +626,60 @@ static void buildSensorOrder() {
   sensorPins[11] = 3;
   sensorPins[12] = 8;
   sensorPins[13] = 18;
+}
+
+/* ===================== LittleFS file serving ===================== */
+String getContentType(const String& path) {
+  if (path.endsWith(".html")) return "text/html";
+  if (path.endsWith(".htm"))  return "text/html";
+  if (path.endsWith(".js"))   return "application/javascript";
+  if (path.endsWith(".mjs"))  return "application/javascript";
+  if (path.endsWith(".css"))  return "text/css";
+  if (path.endsWith(".json")) return "application/json";
+  if (path.endsWith(".png"))  return "image/png";
+  if (path.endsWith(".jpg"))  return "image/jpeg";
+  if (path.endsWith(".jpeg")) return "image/jpeg";
+  if (path.endsWith(".svg"))  return "image/svg+xml";
+  if (path.endsWith(".ico"))  return "image/x-icon";
+  if (path.endsWith(".woff")) return "font/woff";
+  if (path.endsWith(".woff2"))return "font/woff2";
+  return "text/plain";
+}
+
+bool handleFileRead(const String& pathRequested) {
+  String path = pathRequested;
+  if (path.endsWith("/")) path += "index.html";
+
+  if (!LittleFS.exists(path)) {
+    if (LittleFS.exists("/index.html")) {
+      File file = LittleFS.open("/index.html", "r");
+      if (!file) return false;
+      addCORS();
+      http.streamFile(file, "text/html");
+      file.close();
+      return true;
+    }
+    return false;
+  }
+
+  File file = LittleFS.open(path, "r");
+  if (!file) return false;
+  String contentType = getContentType(path);
+  addCORS();
+  http.streamFile(file, contentType);
+  file.close();
+  return true;
+}
+
+void handleRoot() {
+  if (handleFileRead("/index.html")) return;
+
+  // Fallback if LittleFS missing/empty
+  addCORS();
+  String html =
+    "<h3>PaceBot</h3>"
+    "<p>LittleFS index.html not found. Use /wifi/scan and /wifi/connect to provision. Use /config to tune.</p>";
+  http.send(200, "text/html", html);
 }
 
 /* ===================== Wi-Fi ===================== */
@@ -653,16 +714,6 @@ bool startSTA(const String& ssid, const String& pass) {
 }
 
 /* ===================== HTTP ===================== */
-void handleRoot() {
-  addCORS();
-  String html =
-    "<h3>PaceBot</h3>"
-    "<p>Use /wifi/scan and /wifi/connect to provision. Use /config to tune.</p>"
-    "<pre>Mode: " +
-    String((WiFi.isConnected() ? "STA " + WiFi.localIP().toString() : "AP " + WiFi.softAPIP().toString())) +
-    "</pre>";
-  http.send(200, "text/html", html);
-}
 void handleScan() {
   if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
   int n = WiFi.scanNetworks(false, false);
@@ -785,54 +836,21 @@ void onWSEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t len) {
 
 /* ===================== Telemetry & Control ===================== */
 void wsBroadcastTelemetry() {
-  // ===== Ambient-aware + sequential emitters + temporal median =====
-  uint16_t frame[NUM_SENSORS];
-  uint16_t smoothed[NUM_SENSORS];
+  readQTRRawAll();
+  qtrNormalizeAll();
+
   int confidence = 0;
+  for (int i=0;i<NUM_SENSORS;i++) confidence += normVals[i];
 
-  for (int i=0;i<7;i++){
-    uint16_t raw = readQTR_RC_delta(sensorPins[i], cfg.qtr_timeout_us, /*left*/true, /*right*/false);
-    uint16_t v   = normalize(raw, calMin[i], calMax[i]);
-    if (cfg.white_line) v = 1000 - v;
-    if (cfg.qtr_gamma != 1.0f) {
-      float f = powf(v / 1000.0f, cfg.qtr_gamma);
-      v = (uint16_t)(f * 1000.0f + 0.5f);
-    }
-    frame[i] = v;
-  }
-
-  for (int i=7;i<14;i++){
-    uint16_t raw = readQTR_RC_delta(sensorPins[i], cfg.qtr_timeout_us, /*left*/false, /*right*/true);
-    uint16_t v   = normalize(raw, calMin[i], calMax[i]);
-    if (cfg.white_line) v = 1000 - v;
-    if (cfg.qtr_gamma != 1.0f) {
-      float f = powf(v / 1000.0f, cfg.qtr_gamma);
-      v = (uint16_t)(f * 1000.0f + 0.5f);
-    }
-    frame[i] = v;
-  }
-
-  qtrEmitters(true, true);
-
-  temporalPush(frame);
-  temporalMedian(smoothed);
-
-  // Confidence & contrast
-  for (int i=0;i<NUM_SENSORS;i++) confidence += smoothed[i];
-  int contrast = contrastTop3MinusBottom3(smoothed);
-  bool lineOk  = (contrast >= cfg.min_line_contrast);
-
-  // Robust centroid around bright band
-  bool hasLine=false;
-  long error = robustCentroid(smoothed, /*band=*/200, hasLine);
+  long pos    = readLinePosition();
+  long error  = LINE_CENTER_POS - pos;   // If steering reversed, flip sign here
   long absErr = labs(error);
 
-  // ---- Control dispatch (mode-based) ----
+  bool lineOk = (confidence >= cfg.lost_confidence_sum);
   bool arming = (millis() - bootMs < cfg.esc_arm_ms);
 
   if (mode == FOLLOW_TRACK) {
-    if (!lineOk || !hasLine) {
-      // Lost line → steer neutral, slow
+    if (!lineOk) {
       steer.writeMicroseconds(cfg.us_neu);
       throttle.writeMicroseconds(arming ? cfg.us_neu : cfg.throttle_min);
       lastSteerUS = cfg.us_neu;
@@ -847,7 +865,6 @@ void wsBroadcastTelemetry() {
       }
     }
   } else if (mode == TELEOP) {
-    // Safety: neutral if command stale or still arming
     uint32_t nowms = millis();
     if (nowms - lastTeleopMs > TELEOP_TIMEOUT_MS || arming) {
       teleopSteerUS = cfg.us_neu;
@@ -858,7 +875,6 @@ void wsBroadcastTelemetry() {
     lastSteerUS = teleopSteerUS;
     lastThrottleUS = teleopThrottleUS;
   } else {
-    // IDLE / PACE_ATHLETE / MAP_TRACK -> hold neutral for now
     steer.writeMicroseconds(cfg.us_neu);
     throttle.writeMicroseconds(cfg.us_neu);
     lastSteerUS = cfg.us_neu;
@@ -869,9 +885,9 @@ void wsBroadcastTelemetry() {
   bool imu_ok = imuRead6500();
 
   // Convert error units to centimeters (1000 units ≈ 4 mm)
-  float line_error_cm = (!lineOk || !hasLine) ? NAN : (error * 0.0004f);
+  float line_error_cm = !lineOk ? NAN : (error * 0.0004f);
 
-  // JSON
+  // JSON telemetry
   DynamicJsonDocument t(1700);
   t["type"]       = "telemetry";
   t["ts"]         = (uint32_t)millis();
@@ -887,14 +903,15 @@ void wsBroadcastTelemetry() {
   if (WiFi.status() == WL_CONNECTED) t["rssi"] = WiFi.RSSI();
 
   // RC/QTR
-  if (!lineOk || !hasLine) t["line_error_cm"] = nullptr;
-  else                      t["line_error_cm"] = line_error_cm;
-  t["qtr_quality"]   = confidence;    // 0..14000 (approx; lower on wood)
+  if (!lineOk) t["line_error_cm"] = nullptr;
+  else         t["line_error_cm"] = line_error_cm;
+
+  t["qtr_quality"]   = confidence;    // 0..~14000
   t["steer_us"]      = lastSteerUS;
   t["throttle_us"]   = lastThrottleUS;
 
   JsonArray qn = t.createNestedArray("qtr_norm");
-  for (int i=0;i<NUM_SENSORS;i++) qn.add((int)smoothed[i]);
+  for (int i=0;i<NUM_SENSORS;i++) qn.add((int)normVals[i]);
 
   // IMU
   if (imu_ok) {
@@ -916,7 +933,7 @@ void wsBroadcastTelemetry() {
   t["speed_mps"]   = speed_mps_curr;
   t["distance_m"]  = distance_m_accum;
 
-  // Battery placeholder (wire in later)
+  // Battery placeholder
   t["battery_v"]   = 7.6;
 
   // Include current config
@@ -932,6 +949,13 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   bootMs = millis();
+
+  // LittleFS
+  if (!LittleFS.begin(true)) {
+    Serial.println("[LittleFS] Mount failed");
+  } else {
+    Serial.println("[LittleFS] Mounted OK");
+  }
 
   buildSensorOrder();
   pinMode(EMITTER1_PIN, OUTPUT);
@@ -958,7 +982,6 @@ void setup() {
   steer.writeMicroseconds(cfg.us_neu);
   throttle.writeMicroseconds(cfg.us_neu);
 
-  // Wi-Fi: try STA → else AP
   String ssid = prefs.getString("ssid", "");
   String pass = prefs.getString("pass", "");
   bool staOK = false;
@@ -966,25 +989,25 @@ void setup() {
   if (!staOK) startAP();
 
   // HTTP routes
+  http.on("/", HTTP_GET, handleRoot);
 
   // ---- Wi-Fi routes ----
-  http.on("/wifi/scan",    HTTP_OPTIONS, [](){ addCORS(); http.send(204); });   // <-- add
+  http.on("/wifi/scan",    HTTP_OPTIONS, [](){ addCORS(); http.send(204); });
   http.on("/wifi/scan",    HTTP_GET,     handleScan);
 
-  http.on("/wifi/status",  HTTP_OPTIONS, [](){ addCORS(); http.send(204); });   // <-- add
+  http.on("/wifi/status",  HTTP_OPTIONS, [](){ addCORS(); http.send(204); });
   http.on("/wifi/status",  HTTP_GET,     handleStatus);
 
-  http.on("/wifi/connect", HTTP_OPTIONS, [](){ addCORS(); http.send(204); });   // already there
+  http.on("/wifi/connect", HTTP_OPTIONS, [](){ addCORS(); http.send(204); });
   http.on("/wifi/connect", HTTP_POST,    handleConnectWiFi);
 
-  http.on("/wifi/forget",  HTTP_OPTIONS, [](){ addCORS(); http.send(204); });   // <-- add
+  http.on("/wifi/forget",  HTTP_OPTIONS, [](){ addCORS(); http.send(204); });
   http.on("/wifi/forget",  HTTP_POST, []() {
     addCORS();
     prefs.clear();
     http.send(200, "application/json", "{\"ok\":true,\"msg\":\"WiFi credentials cleared\"}");
     Serial.println("[WiFi] Cleared stored credentials");
   });
-
 
   // Config endpoints
   http.on("/config",       HTTP_OPTIONS, [](){ addCORS(); http.send(204); });
@@ -993,10 +1016,17 @@ void setup() {
   http.on("/config/reset", HTTP_OPTIONS, [](){ addCORS(); http.send(204); });
   http.on("/config/reset", HTTP_POST,    handleResetConfig);
 
-  // catch-all
+  // catch-all: static files or 404
   http.onNotFound([](){
-    if (http.method() == HTTP_OPTIONS) { addCORS(); http.send(204); return; }
+    if (http.method() == HTTP_OPTIONS) {
+      addCORS();
+      http.send(204);
+      return;
+    }
+
     String path = http.uri();
+    if (handleFileRead(path)) return;
+
     addCORS();
     http.send(404, "text/plain", "Not found: " + path);
     Serial.printf("[HTTP 404] %s\n", path.c_str());
@@ -1010,7 +1040,7 @@ void setup() {
   // IMU
   (void)imuBegin6500();
 
-  // QTR calibration
+  // QTR calibration (uses cfg.calibrate_ms, default 7000 ms)
   qtrCalibrate(cfg.calibrate_ms);
 
   Serial.println("[SETUP] Ready");
